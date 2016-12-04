@@ -182,5 +182,82 @@ close(8)                                = 0
 ```
 緊接著呼叫的是某個雙底線開頭的內部介面，這樣的模式我們已經看過很多次了，通常這是在提示我們，這個功能有些內部的構造可以為多個介面共享，因而是個更基本的函數。`__alloc_fd`的註簡潔地解說這是一個**配置一個檔案描述子並設之為忙碌**的函數，傳入的參數有昨天見過的`current->files`，也就是一個程序的開啟檔案狀態；第二個及第三個參數代表的是從0開始、至`RLIMIT_NOFILE`（可開啟檔案上限）結束，想必有用過使用者空間的rlimit指令的讀者對這個概念並不陌生；第四個參數也是照樣傳入。判別是否有**單一程序開啟檔案過多**的錯誤回傳也是在這個部份完成的。
 
-接下來是`do_flip_open`，前兩個參數可以組合成從根目錄開始的絕對路徑，確保一定能夠存取到這個檔案；`op`則是之前組合好的，用來代表使用者想要開啟該檔案的狀態。若是成功的話會進入`else`的部份，
+接下來是`do_flip_open`，前兩個參數可以組合成從根目錄開始的絕對路徑，確保一定能夠存取到這個檔案；`op`則是之前組合好的，用來代表使用者想要開啟該檔案的狀態。若是成功的話會進入`else`的部份，`fsnotify_open`知會檔案系統有一個開啟事件（其內包含一個知會所有parent的traverse，以及一個fsnotify函數），然後提取昨日提過的`fdtable`結構體並安插`f`到指定的`fd`之中，並且回傳這個fd，這便是使用者空間能夠透過`open`呼叫取得的整數了。`fopen`透過`open`取得了這個值之後，將之打包數層以及結合C library提供的buffer功能成為`struct FILE`。這個部份的內部實作有點複雜，略去的部份頗多，有機會的話再一齊檢視。
 
+---
+### 動態追蹤：觀察一般的檔案寫入
+
+考慮以下程式：
+```
+#include<sys/types.h>
+#include<sys/stat.h>
+#include<fcntl.h>
+#include<unistd.h>
+#include<stdio.h>
+
+int main(){
+	int fd = open("/home/noner/test", O_RDWR | O_TRUNC | O_CREAT, 0777);
+	printf("openning file descriptor %d\n", fd);
+	write(fd, "Hello World!\n", 13);
+	return 0;
+}
+```
+這個程式在執行時創建的/home/noner/test檔案位於一個ext4檔案系統中。動態追蹤由它開啟的`fd`，到`write`之類的路徑會與之前嘗試的終端機程式有所不同。在某個時間點按下Ctrl+C可以中斷kernel的debug，然後可以下中斷點如：
+```
+Continuing.
+^C
+Thread 5 received signal SIGINT, Interrupt.
+native_safe_halt () at ./arch/x86/include/asm/irqflags.h:50
+50	}
+(gdb) b sys_write if fd == 3 && count == 13
+Breakpoint 1 at 0xffffffff8122d260: file fs/read_write.c, line 599.
+(gdb) cont
+Continuing.
+[Switching to Thread 3]
+
+Thread 3 hit Breakpoint 1, SyS_write (fd=3, buf=4195986, count=13) at fs/read_write.c:599
+599	SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
+(gdb) x/s buf
+0x400692:	"Hello World!\n"
+```
+之所以可以用`fd == 3`當條件，是因為這個程式很單純以至於我們幾乎可以確定這個新開啟的檔案便是3。經過一些操作之後抵達了上次的關口處，
+```
+ 506 ssize_t __vfs_write(struct file *file, const char __user *p, size_t count,
+ 507                     loff_t *pos)
+ 508 {      
+ 509         if (file->f_op->write)
+ 510                 return file->f_op->write(file, p, count, pos);
+ 511         else if (file->f_op->write_iter)
+ 512                 return new_sync_write(file, p, count, pos);
+ 513         else
+ 514                 return -EINVAL;
+ 515 }
+```
+這次不會在510進入`tty_write`了，而會走512行的`new_sync_write`，
+```
+ 488 static ssize_t new_sync_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+ 489 {                       
+ 490         struct iovec iov = { .iov_base = (void __user *)buf, .iov_len = len };
+ 491         struct kiocb kiocb;
+ 492         struct iov_iter iter;
+ 493         ssize_t ret;    
+ 494                         
+ 495         init_sync_kiocb(&kiocb, filp);
+ 496         kiocb.ki_pos = *ppos;
+ 497         iov_iter_init(&iter, WRITE, &iov, 1, len);
+ 498                         
+ 499         ret = filp->f_op->write_iter(&kiocb, &iter);
+ 500         BUG_ON(ret == -EIOCBQUEUED);                                                                                                     
+ 501         if (ret > 0)    
+ 502                 *ppos = kiocb.ki_pos;
+ 503         return ret;     
+ 504 }                       
+```
+可見499行的類似的呼叫方式，這會導引到`fs/ext4/file.c`的`ext4_file_write_iter`當中。
+
+---
+### 結論
+
+這次雖然在核心空間中找到許多使用者空間的經驗的對應，但在追蹤的過程還是跳過了許多部份，包含`fsnotify`的實質意義，以及終端機相關的謎底都尚未揭曉。不僅僅是受限於篇幅，也受限於筆者的能力。在明日的`close`當中，除了對其本身基本的了解之外，我們要來探索每個console程序在啟動時就已經能夠大方地使用0~2作為標準介面的原因。
+
+感謝各位讀者邦友，我們明天再會。

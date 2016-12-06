@@ -158,5 +158,61 @@ root      1458  0.0  0.2  32984  2696 pts/0    R+   19:58   0:00          \_ ps 
 ```
 [root@archvm ~]# strace -ff /sbin/sshd -D -p 5566 2>&1 | grep open
 ...
+[pid  2485] open("/dev/ptmx", O_RDWR)   = 7
+[pid  2485] open("/etc/group", O_RDONLY|O_CLOEXEC) = 8
+[pid  2485] open("/dev/pts/1", O_RDWR|O_NOCTTY) = 8
+[pid  2485] open("/etc/group", O_RDONLY|O_CLOEXEC) = 9
+[pid  2487] open("/dev/tty", O_RDWR|O_NOCTTY <unfinished ...>
+[pid  2487] <... open resumed> )        = -1 ENXIO (No such device or address)
+[pid  2487] open("/dev/tty", O_RDWR|O_NOCTTY) = -1 ENXIO (No such device or address)
+[pid  2487] open("/dev/pts/1", O_RDWR <unfinished ...>
+[pid  2487] <... open resumed> )        = 4
+[pid  2485] open("/dev/ptmx", O_RDWR)   = 7
+[pid  2485] open("/etc/group", O_RDONLY|O_CLOEXEC) = 8
+[pid  2485] open("/dev/pts/1", O_RDWR|O_NOCTTY) = 8
+[pid  2485] open("/etc/group", O_RDONLY|O_CLOEXEC) = 9
+[pid  2487] open("/dev/tty", O_RDWR|O_NOCTTY <unfinished ...>
+[pid  2487] <... open resumed> )        = -1 ENXIO (No such device or address)
+[pid  2487] open("/dev/tty", O_RDWR|O_NOCTTY) = -1 ENXIO (No such device or address)
+[pid  2487] open("/dev/pts/1", O_RDWR <unfinished ...>
+[pid  2487] <... open resumed> )        = 4
 ```
-但是底下都沒有出現類似的資訊。
+其中，`-ff`是`strace`為了觀察child的行為而下的參數，因此輸出訊息有別於主程序，前方加上程序ID的前綴。至於`sshd`的參數，`-D`是使它不要背景化，`-p 5566`則是指定可以連線的port。因為預先在系統內由systemd管理的sshd無法透過這種方式監控，這裡就需要自己開一個。特別要注意的是`/dev/ptmx`和`/dev/pts`的開啟，因為Linux管理虛擬終端機的方法透過`ptmx`分配。至於這些ID，透過`ps`追蹤：
+```
+root      2483  0.0  0.4  40400  4464 pts/0    S+   21:28   0:00          |   \_ /sbin/sshd -D -p 5566
+root      2485  0.0  0.6 100156  6796 ?        Ss   21:28   0:00          |       \_ sshd: root@pts/1
+root      2487  0.0  0.3  14180  3276 pts/1    Ss   21:28   0:00          |           \_ -bash
+root      2491  0.0  0.2  32984  2752 pts/1    R+   21:28   0:00          |               \_ ps auxf
+```
+開啟檔案狀況可以從/proc/2485/fd觀察得，
+```
+[root@archvm ~]# ls -al /proc/2485/fd（註：這是sshd: root@pts/1）
+total 0
+dr-x------ 2 root root  0 Dec  6 21:28 .
+dr-xr-xr-x 9 root root  0 Dec  6 21:28 ..
+lrwx------ 1 root root 64 Dec  6 21:28 0 -> /dev/null
+lrwx------ 1 root root 64 Dec  6 21:28 1 -> /dev/null
+lrwx------ 1 root root 64 Dec  6 21:35 10 -> /dev/ptmx
+lrwx------ 1 root root 64 Dec  6 21:28 2 -> /dev/null
+lrwx------ 1 root root 64 Dec  6 21:28 3 -> 'socket:[18634]'
+lrwx------ 1 root root 64 Dec  6 21:28 4 -> 'socket:[17744]'
+lr-x------ 1 root root 64 Dec  6 21:28 5 -> 'pipe:[17746]'
+l-wx------ 1 root root 64 Dec  6 21:35 6 -> 'pipe:[17746]'
+lrwx------ 1 root root 64 Dec  6 21:35 7 -> /dev/ptmx
+lrwx------ 1 root root 64 Dec  6 21:35 9 -> /dev/ptmx
+[root@archvm ~]# ls -al /proc/2487/fd（註：這是-bash）
+total 0
+dr-x------ 2 root root  0 Dec  6 21:28 .
+dr-xr-xr-x 9 root root  0 Dec  6 21:28 ..
+lrwx------ 1 root root 64 Dec  6 21:28 0 -> /dev/pts/1
+lrwx------ 1 root root 64 Dec  6 21:28 1 -> /dev/pts/1
+lrwx------ 1 root root 64 Dec  6 21:28 2 -> /dev/pts/1
+lrwx------ 1 root root 64 Dec  6 21:35 255 -> /dev/pts/1
+```
+
+合理懷疑是由sshd的父程序開啟之後，再於-bash程序中使用`dup2`之類的系統呼叫將已開啟的虛擬終端機pts對應到0,1,2，這可以透過類似的手法驗證。`dup`系列的系統呼叫我們之後有機會的話可以再來介紹。也推薦各位參考[這篇](http://blog.csdn.net/u011279649/article/details/9833613)文章，從另外一個面向觀察這件事情。
+
+---
+### 結論
+
+`ioctl`對於一般檔案和特殊檔案都提供許多除了讀寫之外的操作，我們這次除了簡單看了一下終端機的一個`ioctl`指令之外，也大致看到了C語言標準輸入輸出的啟動如何與虛擬終端機的特殊檔案開啟扯上關係。明天開始我們將進入程序管理的系統呼叫篇章，明日再會！

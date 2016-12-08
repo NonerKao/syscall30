@@ -125,10 +125,104 @@ strace: Process 12918 attached
 ---
 ### `wait4`
 
-`wait4`在`kernel/exit.c`中，
+`wait4`在`kernel/exit.c`中，我們分三段來看：
 ```
-
+1674 SYSCALL_DEFINE4(wait4, pid_t, upid, int __user *, stat_addr,
+1675                 int, options, struct rusage __user *, ru)
+1676 {       
+1677         struct wait_opts wo;
+1678         struct pid *pid = NULL;
+1679         enum pid_type type;
+1680         long ret;
+1681         
+1682         if (options & ~(WNOHANG|WUNTRACED|WCONTINUED|
+1683                         __WNOTHREAD|__WCLONE|__WALL))
+1684                 return -EINVAL;
 ```
+傳入的四個參數分別是程序的編號、狀態變數的位址、額外選項以及waitpid沒有的資源使用結構。一開始先判斷是否有未定義的選項出現，上面三個是歷史比較悠久的flag，下面這個則是Linux 4.7才加入的功能，目的是為了提供`clone`產生的執行緒也能夠有等待的機制去管理。
+```
+1686         if (upid == -1)
+1687                 type = PIDTYPE_MAX;
+1688         else if (upid < 0) {
+1689                 type = PIDTYPE_PGID;
+1690                 pid = find_get_pid(-upid);
+1691         } else if (upid == 0) {
+1692                 type = PIDTYPE_PGID;
+1693                 pid = get_task_pid(current, PIDTYPE_PGID);
+1694         } else /* upid > 0 */ {
+1695                 type = PIDTYPE_PID;
+1696                 pid = find_get_pid(upid);
+1697         }
+```
+中段的部份，測試傳入的程序編號形式，這個部份在使用手冊有完整定義（`waitpid(2)`）：
+```
+       The value of pid can be:
 
+       < -1   meaning wait for any child process whose process group ID is equal to the absolute value of pid.
 
+       -1     meaning wait for any child process.
 
+       0      meaning wait for any child process whose process group ID is equal to that of the calling process.
+
+       > 0    meaning wait for the child whose process ID is equal to the value of pid.
+```
+我們使用的這個範例程式會進入最後一個`else`的範圍，因為我們有確實指定`upid`。`find_get_pid`這個呼叫可以把一個編號轉換成`pid`結構，
+```
+（kernel/pid.c中）
+488 struct pid *find_get_pid(pid_t nr)
+489 {              
+490         struct pid *pid;
+491                
+492         rcu_read_lock();
+493         pid = get_pid(find_vpid(nr));                                                                                                    
+494         rcu_read_unlock();
+495                
+496         return pid;
+497 }              
+```
+內容是先用RCU機制保護之後，呼叫`find_vpid`，也就是尋找經過namespace虛擬化的程序編號，這個階段就會回傳一個`pid`結構，
+```
+366 struct pid *find_pid_ns(int nr, struct pid_namespace *ns)
+367 {      
+368         struct upid *pnr;
+369        
+370         hlist_for_each_entry_rcu(pnr,
+371                         &pid_hash[pid_hashfn(nr, ns)], pid_chain)
+372                 if (pnr->nr == nr && pnr->ns == ns)
+373                         return container_of(pnr, struct pid,
+374                                         numbers[ns->level]);
+375        
+376         return NULL;
+377 }      
+378 EXPORT_SYMBOL_GPL(find_pid_ns);
+379        
+380 struct pid *find_vpid(int nr)
+381 {      
+382         return find_pid_ns(nr, task_active_pid_ns(current));
+383 }      
+```
+先進入380行之後，轉呼叫`find_pid_ns`，傳入nr（待搜尋的程序編號）以及當前工作運行的PID NS；`find_pid_ns`則是跑一個大迴圈，把系統紀錄的每一個`pid`結構拿出來判斷，簡單來說就是針對編號和命名空間兩項檢索。若是找到了，則回傳一個常用巨集`container_of`套用在這個結構。
+
+> `container_of(A, B, C)`是個非常重要的巨集，其中B是一個結構體而C是內部的成員，A是C真正存在的位址，那麼那個對應的B結構的位址再哪裡？有這種需求就可以使用這個巨集了。
+
+全部回傳之後還要使用`get_pid`，其內只是單純一個增加存取數量的指令。
+
+最後一段：
+```
+1699         wo.wo_type      = type;
+1700         wo.wo_pid       = pid;
+1701         wo.wo_flags     = options | WEXITED;
+1702         wo.wo_info      = NULL;
+1703         wo.wo_stat      = stat_addr;
+1704         wo.wo_rusage    = ru;
+1705         ret = do_wait(&wo);
+1706         put_pid(pid);  
+1707                        
+1708         return ret;    
+```
+相對無聊的一個段落，前面就是在填補`wo`也就是`wait_option`結構的一個變數，然後作`do_wait`呼叫。這個呼叫主要會將當前的工作加入wait queue中，然後執行一個不斷檢查所屬子程序或是thread的迴圈，結束之後重新設定當前程序的狀態為RUNNING，並將之從wait queue中移除。
+
+---
+### 結論
+
+這個呼叫有很多種變形，也牽涉到scheduler以及程序的執行狀態。下一次我們連同`clone`一起講解，明天再會！

@@ -10,3 +10,5 @@ labpush: sync
 	git push
 	cd ../syscall30
 
+pulllab:
+	git pull ssh://git@scopelab.cs.nthu.edu.tw:9419/noner/syscall30.git

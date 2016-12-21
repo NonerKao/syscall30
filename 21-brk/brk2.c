@@ -7,14 +7,18 @@ int main(){
 	char *ptr2;
 	sleep(1);
 
-	brk(ptr1 + 512);
+	ptr1 = (char*)malloc(16384);
 	sleep(1);
 
-	ptr2 = (char*)malloc(512);
+	ptr2 = (char*)malloc(16384);
+	sleep(1);
+
+	free(ptr1);
 	sleep(1);
 
 	free(ptr2);
 	sleep(1);
-	//free(ptr1);
-	pause();
+
+	ptr1[100] = ptr1[200] = 'a';
+	ptr2[100] = ptr2[200] = 'b';
 }
